@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"database/sql"
-	"encoding/binary"
 	"fmt"
 	"log"
 	"time"
@@ -44,7 +43,7 @@ func fetchSpans(ctx context.Context, conn *pgx.Conn, tracer trace.Tracer, f *Fix
 		trace_id, parent_id, span_id,
 
 		span_type, span_operation, deparse_info, parameters,
-		span_start, span_start_ns, duration,
+		span_start, span_end,
 
 		startup,
 		pid, subxact_count,
@@ -67,16 +66,15 @@ func fetchSpans(ctx context.Context, conn *pgx.Conn, tracer trace.Tracer, f *Fix
 	fatalIf(err)
 
 	for rows.Next() {
-		var traceId int64
-		var parentId int64
-		var spanId int64
+		var strTraceId string
+		var strParentId string
+		var strSpanId string
 		var span_type string
 		var span_operation string
 		var deparse_info sql.NullString
 		var parameters sql.NullString
 		var span_start time.Time
-		var span_start_ns int16
-		var duration uint64
+		var span_end time.Time
 
 		var startup sql.NullInt64
 		var pid int32
@@ -105,9 +103,9 @@ func fetchSpans(ctx context.Context, conn *pgx.Conn, tracer trace.Tracer, f *Fix
 		var jit_optimization_time sql.NullFloat64
 		var jit_emission_time sql.NullFloat64
 
-		if err := rows.Scan(&traceId, &parentId, &spanId,
+		if err := rows.Scan(&strTraceId, &strParentId, &strSpanId,
 			&span_type, &span_operation, &deparse_info, &parameters,
-			&span_start, &span_start_ns, &duration, &startup, &pid, &subxact_count, &sql_error_code, &rowNumber,
+			&span_start, &span_end, &startup, &pid, &subxact_count, &sql_error_code, &rowNumber,
 			&planStartupCost, &planTotalCost, &planRows, &planWidth,
 			&sharedBlks.hit, &sharedBlks.read, &sharedBlks.dirtied, &sharedBlks.written,
 			&localBlks.hit, &localBlks.read, &localBlks.dirtied, &localBlks.written,
@@ -120,11 +118,20 @@ func fetchSpans(ctx context.Context, conn *pgx.Conn, tracer trace.Tracer, f *Fix
 			&jit_functions, &jit_generation_time, &jit_inlining_time, &jit_optimization_time, &jit_emission_time); err != nil {
 			log.Fatal(err)
 		}
-		log.Printf("traceId: %d, parentId: %d, spanId: %d, span_operation: %s, start: %s, start_ns: %d, duration: %d", traceId, parentId, spanId, span_operation, span_start, span_start_ns, duration)
+		log.Printf("traceId: %s, parentId: %s, spanId: %s, span_operation: %s, start: %s, end: %s", strTraceId, strParentId, strSpanId, span_operation, span_start, span_end)
 
-		utraceId := uint64(traceId)
-		uparentId := uint64(parentId)
-		uspanId := uint64(spanId)
+		traceId, err := trace.TraceIDFromHex(strTraceId)
+		if err != nil {
+			log.Fatal(err)
+		}
+		parentId, err := trace.SpanIDFromHex(strParentId)
+		if err != nil {
+			log.Fatal(err)
+		}
+		spanId, err := trace.SpanIDFromHex(strSpanId)
+		if err != nil {
+			log.Fatal(err)
+		}
 
 		attributes := make([]attribute.KeyValue, 0)
 		setMetricIfValue(attributes, "rows", rowNumber)
@@ -169,26 +176,18 @@ func fetchSpans(ctx context.Context, conn *pgx.Conn, tracer trace.Tracer, f *Fix
 			attributes = append(attributes, attribute.String("error.msg", sql_error_code))
 		}
 
-		traceIdBytes := make([]byte, 16)
-		binary.BigEndian.PutUint64(traceIdBytes[0:16], utraceId)
-		spanIdBytes := make([]byte, 8)
-		binary.BigEndian.PutUint64(spanIdBytes[0:8], uspanId)
-		parentIdBytes := make([]byte, 8)
-		binary.BigEndian.PutUint64(parentIdBytes[0:8], uparentId)
-
 		// TODO: Use span events
 		// setMetricIfValue(attributes, "first_tuple", startup)
 
-		spanStartNs := span_start.Add(time.Duration(span_start_ns))
 		startOptions := []trace.SpanStartOption{
-			trace.WithTimestamp(spanStartNs),
+			trace.WithTimestamp(span_start),
 			trace.WithAttributes(attributes...),
 			trace.WithSpanKind(trace.SpanKindServer),
 		}
 
 		psc := trace.SpanContext{}
-		psc = psc.WithTraceID(trace.TraceID(traceIdBytes))
-		psc = psc.WithSpanID(trace.SpanID(parentIdBytes))
+		psc = psc.WithTraceID(traceId)
+		psc = psc.WithSpanID(parentId)
 		ctx = trace.ContextWithSpanContext(ctx, psc)
 
 		spanName := span_operation
@@ -197,12 +196,11 @@ func fetchSpans(ctx context.Context, conn *pgx.Conn, tracer trace.Tracer, f *Fix
 		}
 
 		// Modify the fixed spanID generator before starting the span
-		f.FixedSpanID = trace.SpanID(spanIdBytes)
+		f.FixedSpanID = spanId
 		_, span := tracer.Start(ctx, spanName, startOptions...)
 		// End the span
-		spanEndNs := spanStartNs.Add(time.Duration(duration))
 		endOptions := []trace.SpanEndOption{
-			trace.WithTimestamp(spanEndNs),
+			trace.WithTimestamp(span_end),
 		}
 		span.End(endOptions...)
 
